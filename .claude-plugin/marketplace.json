@@ -1,0 +1,23 @@
+{
+  "name": "remakebench",
+  "owner": {
+    "name": "RemakeBench",
+    "url": "https://github.com/RemakeBench"
+  },
+  "description": "Public Claude Code skills from the RemakeBench community.",
+  "plugins": [
+    {
+      "name": "remakebench-skills",
+      "source": "./",
+      "description": "Evidence-driven skills for building and verifying playable 3D worlds.",
+      "category": "development",
+      "keywords": [
+        "game-development",
+        "3d",
+        "blender",
+        "verification",
+        "agent-skills"
+      ]
+    }
+  ]
+}

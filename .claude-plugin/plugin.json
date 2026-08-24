@@ -1,0 +1,27 @@
+{
+  "name": "remakebench-skills",
+  "version": "0.1.0",
+  "description": "Evidence-driven Claude Code skills for playable 3D production, asset quality, independent judging, reference-pack authority, and gameplay verification.",
+  "author": {
+    "name": "RemakeBench",
+    "url": "https://github.com/RemakeBench"
+  },
+  "homepage": "https://github.com/RemakeBench/skills",
+  "repository": "https://github.com/RemakeBench/skills",
+  "license": "MIT",
+  "keywords": [
+    "claude-code",
+    "agent-skills",
+    "game-development",
+    "3d",
+    "blender",
+    "quality-assurance"
+  ],
+  "skills": [
+    "./skills/reference-pack-authority",
+    "./skills/game-production-stages",
+    "./skills/3d-asset-quality",
+    "./skills/asset-judge-loop",
+    "./skills/verify-by-playing"
+  ]
+}

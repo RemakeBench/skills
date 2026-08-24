@@ -1,0 +1,21 @@
+[
+  {"query": "im doing the shrine courtyard in blender via mcp tonight — stone water basin, a pair of tōrō, and the little roofed gate at the entrance. working off references/shrine_ref.jpg", "should_trigger": true},
+  {"query": "the machiya shopfronts in assets/machiya_kit.py look flat next to the reference. can you do a pass on them", "should_trigger": true},
+  {"query": "need about 8 market props for the village - crates, barrels, a produce stall, sacks. meshy or tripo is fine if thats quicker than modelling by hand", "should_trigger": true},
+  {"query": "can you go through the assets in scenes/oasis_outpost.blend and tell me honestly if theyre up to standard or if im kidding myself", "should_trigger": true},
+  {"query": "the red sands village reads cheap. i spent all of yesterday on the shaders and it still doesnt look right, what do i do", "should_trigger": true},
+  {"query": "add an arched stone bridge over the pond in the scene. should look like it belongs in the world and not like a grey placeholder", "should_trigger": true},
+  {"query": "im writing a remakebench task where the model has to build a japanese teahouse exterior in blender one-shot. what should the pass criteria be", "should_trigger": true},
+  {"query": "got a cart mesh back from tripo, looks ok from the front but pretty rough. what needs doing to it before i put it in the three.js scene", "should_trigger": true},
+  {"query": "quick one - model me a stone lantern for the courtyard, 1.4m tall ish", "should_trigger": true},
+
+  {"query": "town.glb is 27mb and its killing load time on mobile. can you draco compress it and pull the textures out into separate ktx2 files", "should_trigger": false},
+  {"query": "the character controller falls through the tiled roofs above about 30 degrees of slope. can you look at the capsule vs three-mesh-bvh contact normal code in main.js", "should_trigger": false},
+  {"query": "whats my meshy credit balance and how much does a rig plus two animations cost", "should_trigger": false},
+  {"query": "spin up a runpod pod and run an eval sweep on gemma-27b, 4 configs, 30 min budget, terminate when done", "should_trigger": false},
+  {"query": "the ACES tonemapping in the three.js build looks washed out next to the unity version. can you match the exposure curve", "should_trigger": false},
+  {"query": "generate 6 seamless 1024 tileable textures for paving, plaster and roof tile with an image model and drop them in textures-src/", "should_trigger": false},
+  {"query": "blender keeps crashing on startup since the 5.1 update and the addon list comes up empty. can you work out whats wrong with the install", "should_trigger": false},
+  {"query": "how much did that last runpod bake actually cost? check the report.json under results/ and tell me", "should_trigger": false},
+  {"query": "draft the youtube description and timestamps for the video where i build the village, keep it under 800 chars", "should_trigger": false}
+]
