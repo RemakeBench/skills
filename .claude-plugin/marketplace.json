@@ -9,14 +9,17 @@
     {
       "name": "remakebench-skills",
       "source": "./",
-      "description": "Evidence-driven skills for building and verifying playable 3D worlds.",
+      "description": "Evidence-driven skills for playable 3D production and cross-model Codex and Grok subagents.",
       "category": "development",
       "keywords": [
         "game-development",
         "3d",
         "blender",
         "verification",
-        "agent-skills"
+        "agent-skills",
+        "codex",
+        "grok",
+        "multi-model"
       ]
     }
   ]

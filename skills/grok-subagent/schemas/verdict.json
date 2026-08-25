@@ -1,0 +1,11 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict", "reason", "evidence"],
+  "properties": {
+    "verdict": { "type": "string", "enum": ["pass", "fail", "inconclusive"] },
+    "reason": { "type": "string", "description": "One paragraph. Why this verdict." },
+    "evidence": { "type": "array", "items": { "type": "string" },
+      "description": "Concrete file:line refs, command output, or observations. Empty array means the verdict is an opinion, not a finding." }
+  }
+}

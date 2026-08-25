@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+"""grok-mcp-server — exposes Grok as MCP tools, mirroring `codex mcp-server`.
+
+Grok ships no MCP server mode of its own (`grok mcp` only manages servers it
+connects TO), so this shim provides the equivalent surface on top of the
+grok-sub wrapper: one tool to run a session, one to continue it by session id.
+
+Transport: newline-delimited JSON-RPC 2.0 on stdio. No third-party deps.
+Anything written to stderr is ignored by the client, so it is safe for logging.
+"""
+
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+GROK_SUB = os.path.join(HERE, "grok-sub")
+PROTOCOL_FALLBACK = "2024-11-05"
+
+DEFAULT_EFFORT = os.environ.get("GROK_SUB_EFFORT", "medium")
+DEFAULT_MODEL = os.environ.get("GROK_SUB_MODEL", "grok-4.6")
+DEFAULT_SANDBOX = os.environ.get("GROK_SUB_SANDBOX", "read-only")
+DEFAULT_TIMEOUT = int(os.environ.get("GROK_SUB_TIMEOUT", "900"))
+
+COMMON_PROPS = {
+    "cwd": {"type": "string", "description": "Working directory for the session."},
+    "model": {"type": "string", "description": "Model override, e.g. grok-4.6 or grok-4.5."},
+    "effort": {
+        "type": "string",
+        "enum": ["none", "minimal", "low", "medium", "high", "xhigh", "max"],
+        "description": f"Reasoning effort. Defaults to {DEFAULT_EFFORT}; drop to low/medium for cheap mechanical work.",
+    },
+    "sandbox": {
+        "type": "string",
+        "enum": ["off", "read-only", "workspace", "strict", "devbox"],
+        "description": f"Filesystem sandbox profile. Defaults to {DEFAULT_SANDBOX}. Raise access deliberately only when the task requires writes.",
+    },
+    "schema": {
+        "type": "string",
+        "description": "Structured output: a bare schema name (verdict | findings | plan | answer) or a path to a JSON Schema file.",
+    },
+    "max_turns": {"type": "integer", "description": "Cap on agentic turns."},
+    "tools": {"type": "string", "description": "Comma-separated allowlist of built-in tool ids (e.g. read_file,grep,list_dir)."},
+    "deny_tools": {"type": "string", "description": "Comma-separated denylist of built-in tool ids."},
+    "no_subagents": {"type": "boolean", "description": "Block Grok from spawning its own subagents. Recommended for predictable runs."},
+    "rules": {"type": "string", "description": "Extra rules appended to Grok's system prompt."},
+    "timeout": {"type": "integer", "description": f"Hard timeout in seconds (default {DEFAULT_TIMEOUT})."},
+}
+
+OUTPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "sessionId": {"type": "string"},
+        "content": {"type": "string"},
+        "status": {"type": "string"},
+        "cost_usd": {"type": "number"},
+        "elapsed_s": {"type": "integer"},
+        "effort_applied": {"type": "string"},
+    },
+    "required": ["sessionId", "content"],
+}
+
+TOOLS = [
+    {
+        "name": "grok",
+        "title": "Grok",
+        "description": (
+            "Run a Grok (grok-4.6) session as an independent subagent and return its answer. "
+            "Use for a cross-model second opinion, a judge that cannot rubber-stamp Claude's own "
+            "reasoning, or anything needing Grok's native web search. Set `schema` to get "
+            "validated structured output back."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["prompt"],
+            "properties": dict({"prompt": {"type": "string", "description": "The initial user prompt. Grok starts cold — name files and state the acceptance bar."}}, **COMMON_PROPS),
+        },
+        "outputSchema": OUTPUT_SCHEMA,
+    },
+    {
+        "name": "grok-reply",
+        "title": "Grok Reply",
+        "description": "Continue an existing Grok conversation by session id.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["sessionId", "prompt"],
+            "properties": dict(
+                {
+                    "sessionId": {"type": "string", "description": "Session id returned by a previous `grok` call."},
+                    "prompt": {"type": "string", "description": "The next user prompt."},
+                },
+                **COMMON_PROPS,
+            ),
+        },
+        "outputSchema": OUTPUT_SCHEMA,
+    },
+]
+
+_write_lock = threading.Lock()
+
+
+def send(obj):
+    with _write_lock:
+        sys.stdout.write(json.dumps(obj) + "\n")
+        sys.stdout.flush()
+
+
+def build_argv(args, resume=None, run_dir=None):
+    argv = [
+        GROK_SUB, "-q",
+        "-e", str(args.get("effort") or DEFAULT_EFFORT),
+        "-m", str(args.get("model") or DEFAULT_MODEL),
+        "-s", str(args.get("sandbox") or DEFAULT_SANDBOX),
+        "-t", str(args.get("timeout") or DEFAULT_TIMEOUT),
+        "-l", "mcp",
+    ]
+    if run_dir:
+        argv += ["-R", run_dir]
+    if args.get("schema"):
+        argv += ["-S", str(args["schema"])]
+    if args.get("max_turns"):
+        argv += ["-n", str(args["max_turns"])]
+    if args.get("tools"):
+        argv += ["-T", str(args["tools"])]
+    if args.get("deny_tools"):
+        argv += ["-D", str(args["deny_tools"])]
+    if args.get("rules"):
+        argv += ["-u", str(args["rules"])]
+    if args.get("no_subagents"):
+        argv.append("-X")
+    if resume:
+        argv += ["-r", str(resume)]
+    # `--` is mandatory: a prompt starting with "-" would otherwise parse as a flag.
+    argv += ["--", str(args.get("prompt", ""))]
+    return argv
+
+
+def run_grok(args, resume=None, progress=None):
+    """Run grok-sub. Returns (structured_dict, text, is_error)."""
+    cwd = args.get("cwd") or os.getcwd()
+    if not os.path.isdir(cwd):
+        return None, f"cwd does not exist: {cwd}", True
+
+    # An explicit run dir is the reliable way to find meta.json: `-q` suppresses the
+    # banner that would otherwise carry run_dir=, so parsing stderr for it finds nothing.
+    run_dir = tempfile.mkdtemp(prefix="grok-mcp-", dir=os.environ.get("TMPDIR") or "/tmp")
+
+    proc = subprocess.Popen(
+        build_argv(args, resume, run_dir), cwd=cwd,
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    stop = threading.Event()
+    if progress:
+        def beat():
+            started = time.time()
+            while not stop.wait(10):
+                progress(int(time.time() - started))
+        threading.Thread(target=beat, daemon=True).start()
+
+    out, err = proc.communicate()
+    stop.set()
+
+    # grok-sub's own metadata is the source of truth for usage, cost and the
+    # effort that was ACTUALLY applied (the flag is not proof).
+    meta = {}
+    try:
+        with open(os.path.join(run_dir, "meta.json")) as fh:
+            meta = json.load(fh)
+    except Exception:
+        pass
+
+    text = (out or "").strip()
+    structured = {
+        "sessionId": meta.get("session_id", ""),
+        "content": text,
+        "status": meta.get("status", "ok" if proc.returncode == 0 else "error"),
+        "cost_usd": meta.get("cost_usd", 0),
+        "elapsed_s": meta.get("elapsed_s", 0),
+        "effort_applied": meta.get("effort_applied", ""),
+    }
+
+    if proc.returncode != 0:
+        detail = text or (err or "").strip() or f"grok-sub exited {proc.returncode}"
+        return structured, f"[{structured['status']}] {detail}", True
+    return structured, text, False
+
+
+def handle(msg):
+    """Returns a response dict, or None for notifications."""
+    method = msg.get("method")
+    mid = msg.get("id")
+
+    if method == "initialize":
+        requested = (msg.get("params") or {}).get("protocolVersion")
+        return {"jsonrpc": "2.0", "id": mid, "result": {
+            "protocolVersion": requested or PROTOCOL_FALLBACK,
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": "grok-mcp-server", "title": "Grok", "version": "1.0.0"},
+        }}
+
+    if method == "ping":
+        return {"jsonrpc": "2.0", "id": mid, "result": {}}
+
+    if method == "tools/list":
+        return {"jsonrpc": "2.0", "id": mid, "result": {"tools": TOOLS}}
+
+    if method == "tools/call":
+        params = msg.get("params") or {}
+        name = params.get("name")
+        args = params.get("arguments") or {}
+        token = ((params.get("_meta") or {}).get("progressToken"))
+
+        def progress(elapsed):
+            if token is not None:
+                send({"jsonrpc": "2.0", "method": "notifications/progress", "params": {
+                    "progressToken": token, "progress": elapsed,
+                    "message": f"grok running ({elapsed}s)",
+                }})
+
+        if name == "grok":
+            structured, text, is_error = run_grok(args, None, progress)
+        elif name == "grok-reply":
+            structured, text, is_error = run_grok(args, args.get("sessionId"), progress)
+        else:
+            return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32602, "message": f"unknown tool: {name}"}}
+
+        result = {"content": [{"type": "text", "text": text}], "isError": is_error}
+        if structured and not is_error:
+            result["structuredContent"] = structured
+        return {"jsonrpc": "2.0", "id": mid, "result": result}
+
+    if mid is None:
+        return None  # a notification we do not act on
+    return {"jsonrpc": "2.0", "id": mid, "error": {"code": -32601, "message": f"method not found: {method}"}}
+
+
+def main():
+    if not os.access(GROK_SUB, os.X_OK):
+        print(f"grok-mcp-server: {GROK_SUB} is not executable", file=sys.stderr)
+        return 3
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            send({"jsonrpc": "2.0", "id": None, "error": {"code": -32700, "message": "parse error"}})
+            continue
+        try:
+            resp = handle(msg)
+        except Exception as exc:  # never die on one bad call
+            resp = {"jsonrpc": "2.0", "id": msg.get("id"), "error": {"code": -32603, "message": str(exc)}}
+        if resp is not None:
+            send(resp)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

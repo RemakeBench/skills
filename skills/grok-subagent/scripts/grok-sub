@@ -1,0 +1,307 @@
+#!/bin/bash
+# grok-sub — run one Grok subagent non-interactively and return its answer.
+#
+# Defaults: model grok-4.6, reasoning effort medium, sandbox read-only.
+# Answer goes to STDOUT (structuredOutput when a schema is used, else the text).
+# Banner, session id, cost -> STDERR.
+# Exit codes: 0 ok | 1 grok failed / empty | 2 bad usage | 3 grok binary not found
+#             5 schema given but no structured output came back | 124 timeout
+
+set -u
+
+# Everything below is one brace group. Bash parses a compound command IN FULL before
+# running any of it, so this process never reads the script file again after startup —
+# editing the file while a run is in flight can no longer inject garbage into that run.
+# (Observed: a long run died with "null: command not found" at a blank line because the
+# file was patched mid-flight and the interpreter resumed at a stale byte offset.)
+{
+
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [ -L "$SCRIPT_PATH" ]; do
+  SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+  LINK_TARGET="$(readlink "$SCRIPT_PATH")"
+  case "$LINK_TARGET" in
+    /*) SCRIPT_PATH="$LINK_TARGET" ;;
+    *) SCRIPT_PATH="$SCRIPT_DIR/$LINK_TARGET" ;;
+  esac
+done
+SKILL_DIR="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
+
+MODEL="${GROK_SUB_MODEL:-grok-4.6}"
+EFFORT="${GROK_SUB_EFFORT:-medium}"
+SANDBOX="${GROK_SUB_SANDBOX:-read-only}"
+CWD="$PWD"
+SCHEMA=""
+TIMEOUT="${GROK_SUB_TIMEOUT:-900}"
+MAX_TURNS=""
+DENY_TOOLS=""
+ALLOW_TOOLS=""
+RULES=""
+LABEL="run"
+RESUME=""
+QUIET=0
+PROGRESS=0
+NO_SUBAGENTS=0
+PROMPT=""
+TURNS_SALVAGED=""
+
+usage() {
+  cat >&2 <<'EOF'
+grok-sub [options] "PROMPT"           (prompt may also be piped on stdin)
+
+  -m MODEL     grok-4.6 | grok-4.5                       (default grok-4.6)
+  -e EFFORT    none|minimal|low|medium|high|xhigh|max     (default medium)
+  -s SANDBOX   off|read-only|workspace|strict|devbox      (default read-only)
+  -C DIR       working root for the subagent              (default $PWD)
+  -S SCHEMA    JSON Schema file, or a bare name from the skill's schemas/ dir
+               (verdict | findings | plan | answer). Returns parsed structured output.
+  -n N         --max-turns cap on agentic turns
+  -T TOOLS     allowlist of built-in tools (comma-separated internal ids,
+               e.g. read_file,grep,list_dir — the shell tool is run_terminal_cmd)
+  -D TOOLS     denylist of built-in tools (comma-separated)
+  -X           block Grok from spawning its own subagents (--disallowed-tools Agent)
+  -u RULES     extra rules appended to Grok's system prompt
+  -t SECONDS   hard timeout                               (default 900)
+  -l LABEL     short label used for the run directory
+  -r SESSION   resume an existing session id (multi-turn)
+  -R DIR       explicit run directory
+  -P           stream live progress (tool calls) to stderr — use this whenever the
+               call is launched as a background Bash task, so the task panel shows
+               what the subagent is doing instead of sitting blank
+  -q           quiet: suppress the stderr banner
+  -h           this help
+
+Run artifacts land in $GROK_SUB_RUNS (default $TMPDIR/grok-sub-runs)/<label>-<stamp>/:
+  prompt.txt  result.json (full grok JSON)  answer.txt  meta.json  stderr.txt
+EOF
+}
+
+need() { if [ "$2" -lt 2 ]; then echo "grok-sub: option $1 requires a value" >&2; exit 2; fi; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -m) need "$1" $#; MODEL="$2"; shift 2 ;;
+    -e) need "$1" $#; EFFORT="$2"; shift 2 ;;
+    -s) need "$1" $#; SANDBOX="$2"; shift 2 ;;
+    -C) need "$1" $#; CWD="$2"; shift 2 ;;
+    -S) need "$1" $#; SCHEMA="$2"; shift 2 ;;
+    -n) need "$1" $#; MAX_TURNS="$2"; shift 2 ;;
+    -T) need "$1" $#; ALLOW_TOOLS="$2"; shift 2 ;;
+    -D) need "$1" $#; DENY_TOOLS="$2"; shift 2 ;;
+    -u) need "$1" $#; RULES="$2"; shift 2 ;;
+    -t) need "$1" $#; TIMEOUT="$2"; shift 2 ;;
+    -l) need "$1" $#; LABEL="$2"; shift 2 ;;
+    -r) need "$1" $#; RESUME="$2"; shift 2 ;;
+    -R) need "$1" $#; RUN_DIR="$2"; shift 2 ;;
+    -P) PROGRESS=1; shift ;;
+    -X) NO_SUBAGENTS=1; shift ;;
+    -q) QUIET=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; PROMPT="$*"; break ;;
+    -*) echo "grok-sub: unknown option $1" >&2; usage; exit 2 ;;
+    *) PROMPT="$1"; shift ;;
+  esac
+done
+
+if [ -z "$PROMPT" ] && [ ! -t 0 ]; then PROMPT="$(cat)"; fi
+if [ -z "$PROMPT" ]; then echo "grok-sub: no prompt given" >&2; usage; exit 2; fi
+
+command -v jq >/dev/null 2>&1 || { echo "grok-sub: jq is required" >&2; exit 2; }
+
+# ---- locate the grok binary --------------------------------------------------
+BIN=""
+for c in "${GROK_BIN:-}" "$(command -v grok 2>/dev/null)" \
+         "${HOME:-/nonexistent}/.local/bin/grok" "${HOME:-/nonexistent}/.grok/bin/grok"; do
+  if [ -n "$c" ] && [ -f "$c" ] && [ -x "$c" ]; then BIN="$c"; break; fi
+done
+[ -z "$BIN" ] && { echo "grok-sub: grok binary not found (set GROK_BIN)" >&2; exit 3; }
+
+# ---- resolve schema shorthand ------------------------------------------------
+# A bare name (no slash, no .json) ALWAYS means the skill's schemas/ dir. Checking the
+# filesystem first let a stray ./findings file in the workspace shadow the shorthand.
+if [ -n "$SCHEMA" ]; then
+  case "$SCHEMA" in
+    */*|*.json) : ;;
+    *) if [ -f "$SKILL_DIR/schemas/$SCHEMA.json" ]; then SCHEMA="$SKILL_DIR/schemas/$SCHEMA.json"; fi ;;
+  esac
+  if [ ! -f "$SCHEMA" ]; then echo "grok-sub: schema not found: $SCHEMA" >&2; exit 2; fi
+fi
+
+# ---- run directory -----------------------------------------------------------
+RUNS_ROOT="${GROK_SUB_RUNS:-${TMPDIR:-/tmp}/grok-sub-runs}"
+SAFE_LABEL="$(printf '%s' "$LABEL" | tr -d '\n' | tr -cs 'A-Za-z0-9._-' '-' | sed 's/^[.-]*//; s/[-.]*$//' | cut -c1-40)"
+[ -z "$SAFE_LABEL" ] && SAFE_LABEL="run"
+if [ -z "${RUN_DIR:-}" ]; then RUN_DIR="$RUNS_ROOT/$SAFE_LABEL-$(date +%Y%m%d-%H%M%S)-$$"; fi
+mkdir -p "$RUN_DIR" || { echo "grok-sub: cannot create $RUN_DIR" >&2; exit 2; }
+rm -f "$RUN_DIR/.timed_out"   # -R reuse must not inherit a previous run's stamp
+printf '%s' "$PROMPT" > "$RUN_DIR/prompt.txt"
+
+# ---- assemble the command ----------------------------------------------------
+# --verbatim stops Grok from rewriting the prompt; the prompt is already exact.
+# `--single=<value>` (one argv word), NOT `-p <value>`: grok's clap rejects a separate
+# value that starts with "-" as an unknown flag, so a markdown-list or diff-hunk prompt
+# dies with "unexpected argument '- '".
+ARGS=(--single="$PROMPT" -m "$MODEL" --effort "$EFFORT" --cwd "$CWD"
+      --output-format json --verbatim --no-auto-update)
+[ "$SANDBOX" != "off" ] && ARGS+=(--sandbox "$SANDBOX")
+[ -n "$SCHEMA" ] && ARGS+=(--json-schema "$(cat "$SCHEMA")")
+[ -n "$MAX_TURNS" ] && ARGS+=(--max-turns "$MAX_TURNS")
+[ -n "$ALLOW_TOOLS" ] && ARGS+=(--tools "$ALLOW_TOOLS")
+if [ "$NO_SUBAGENTS" -eq 1 ]; then
+  if [ -n "$DENY_TOOLS" ]; then DENY_TOOLS="$DENY_TOOLS,Agent"; else DENY_TOOLS="Agent"; fi
+fi
+[ -n "$DENY_TOOLS" ] && ARGS+=(--disallowed-tools "$DENY_TOOLS")
+[ -n "$RULES" ] && ARGS+=(--rules "$RULES")
+[ -n "$RESUME" ] && ARGS+=(-r "$RESUME")
+# Grok only writes its live event log under a session id we otherwise learn at the END.
+# `-s <uuid>` names a NEW session up front (invalid with --resume), which is what makes
+# live progress possible at all.
+PRESET_SESSION=""
+if [ -z "$RESUME" ] && command -v uuidgen >/dev/null 2>&1; then
+  PRESET_SESSION=$(uuidgen | tr 'A-Z' 'a-z')
+  ARGS+=(-s "$PRESET_SESSION")
+fi
+
+START=$(date +%s)
+
+"$BIN" "${ARGS[@]}" </dev/null >"$RUN_DIR/result.json" 2>"$RUN_DIR/stderr.txt" &
+PID=$!
+# Watchdog fds go to /dev/null so its `sleep` cannot hold a caller's $(...) pipe open,
+# and the `kill -0` guard stops the subshell — whose `sleep` cleanup below kills, making
+# it RETURN and fall through — from stamping a timeout on a run that finished fine.
+{ sleep "$TIMEOUT"
+  kill -0 "$PID" 2>/dev/null || exit 0
+  : > "$RUN_DIR/.timed_out"; kill -TERM "$PID" 2>/dev/null
+  sleep 5; kill -KILL "$PID" 2>/dev/null; } >/dev/null 2>&1 &
+WATCHDOG=$!
+
+# Live progress for the background-task panel. Polls by line offset so it ends when grok
+# does; `phase_changed` is skipped (a single short run emits ~290 of them).
+if [ "$PROGRESS" -eq 1 ] && [ "$QUIET" -ne 1 ]; then
+  { SEEN=0; BEAT=0; EV=""
+    echo "  $SAFE_LABEL | grok $MODEL/$EFFORT starting" >&2
+    while kill -0 "$PID" 2>/dev/null; do
+      if [ -z "$EV" ] && [ -n "$PRESET_SESSION" ]; then
+        SDIR=$(find "${HOME:-/nonexistent}/.grok/sessions" -maxdepth 2 -type d -name "$PRESET_SESSION" 2>/dev/null | head -1)
+        [ -n "$SDIR" ] && [ -f "$SDIR/events.jsonl" ] && EV="$SDIR/events.jsonl"
+      fi
+      if [ -n "$EV" ]; then
+        TOTAL=$(wc -l < "$EV" 2>/dev/null | tr -d ' '); TOTAL=${TOTAL:-0}
+        if [ "$TOTAL" -gt "$SEEN" ]; then
+          sed -n "$((SEEN + 1)),${TOTAL}p" "$EV" 2>/dev/null | jq -r --arg L "$SAFE_LABEL" '
+            if   .type=="tool_started"          then "  \($L) | " + (.tool_name // "tool")
+            elif .type=="tool_completed"        then "  \($L) | " + (.tool_name // "tool") + " -> " + (.outcome // "?") + " (" + ((.duration_ms // 0)|tostring) + "ms)"
+            elif .type=="permission_requested"  then "  \($L) | permission requested"
+            elif .type=="turn_started"          then "  \($L) | turn started"
+            elif .type=="mcp_server_failed"     then "  \($L) | mcp failed: " + (.server_name // "?")
+            else empty end' 2>/dev/null
+          SEEN=$TOTAL
+        fi
+      fi
+      BEAT=$((BEAT + 1))
+      [ $((BEAT % 30)) -eq 0 ] && echo "  $SAFE_LABEL | still working (${BEAT}s)" >&2
+      sleep 1
+    done; } >&2 &
+  PROGRESS_PID=$!
+fi
+
+exec 3>&2 2>/dev/null
+wait "$PID"; RC=$?
+pkill -P "$WATCHDOG" >/dev/null 2>&1
+# Waited for, never signalled — killing it makes bash print a job notice to the caller.
+[ -n "${PROGRESS_PID:-}" ] && wait "$PROGRESS_PID" 2>/dev/null
+kill "$WATCHDOG" >/dev/null 2>&1
+wait "$WATCHDOG" 2>/dev/null
+exec 2>&3 3>&-
+
+END=$(date +%s); ELAPSED=$((END - START))
+if [ -f "$RUN_DIR/.timed_out" ] && [ "$RC" -ne 0 ]; then RC=124
+elif [ "$RC" -ne 0 ]; then RC=1; fi
+
+# ---- harvest ------------------------------------------------------------------
+SESSION=""; USAGE="{}"; COST="0"; TURNS="0"; STOP=""
+if [ -s "$RUN_DIR/result.json" ] && jq -e . "$RUN_DIR/result.json" >/dev/null 2>&1; then
+  SESSION=$(jq -r '.sessionId // ""'      "$RUN_DIR/result.json")
+  USAGE=$(jq -c  '.usage // {}'           "$RUN_DIR/result.json")
+  COST=$(jq -r   '.total_cost_usd // 0'   "$RUN_DIR/result.json")
+  TURNS=$(jq -r  '.num_turns // 0'        "$RUN_DIR/result.json")
+  STOP=$(jq -r   '.stopReason // ""'      "$RUN_DIR/result.json")
+fi
+
+# Grok records the effort it ACTUALLY applied in the session summary. Harvest it so
+# meta.json carries a verified value rather than the flag we hoped took effect.
+EFFORT_APPLIED=""
+if [ -n "$SESSION" ]; then
+  SUMMARY=$(find "${HOME:-/nonexistent}/.grok/sessions" -maxdepth 2 -type d -name "$SESSION" 2>/dev/null | head -1)
+  [ -n "$SUMMARY" ] && [ -f "$SUMMARY/summary.json" ] && \
+    EFFORT_APPLIED=$(jq -r '.. | objects | select(has("reasoning_effort")) | .reasoning_effort' "$SUMMARY/summary.json" 2>/dev/null | head -1)
+fi
+
+# Structured output is a real object in Grok's result — prefer it over re-parsing .text.
+OUT=""
+if [ -n "$SCHEMA" ]; then
+  OUT=$(jq -c '.structuredOutput // empty' "$RUN_DIR/result.json" 2>/dev/null)
+  # Fallback: some runs put the JSON only in .text.
+  if [ -z "$OUT" ]; then
+    OUT=$(jq -r '.text // ""' "$RUN_DIR/result.json" 2>/dev/null | jq -c . 2>/dev/null)
+  fi
+else
+  OUT=$(jq -r '.text // ""' "$RUN_DIR/result.json" 2>/dev/null)
+fi
+printf '%s' "$OUT" > "$RUN_DIR/answer.txt"
+
+# A killed run leaves stdout empty, so everything it did would be lost. Grok's session
+# record survives the kill — recover the turn count, the tools it ran and its last message
+# so a timeout reports partial work instead of silence. (Every timeout observed on this
+# machine was the 900s default wall, never a stall; the work was real and was being thrown away.)
+if [ "$RC" -eq 124 ] && [ -n "$PRESET_SESSION" ]; then
+  SDIR=$(find "${HOME:-/nonexistent}/.grok/sessions" -maxdepth 2 -type d -name "$PRESET_SESSION" 2>/dev/null | head -1)
+  if [ -n "$SDIR" ] && [ -f "$SDIR/chat_history.jsonl" ]; then
+    [ -z "$SESSION" ] && SESSION="$PRESET_SESSION"
+    SALV=$(jq -r 'select(.type=="assistant")|.content' "$SDIR/chat_history.jsonl" 2>/dev/null | tail -20)
+    TOOLS=$(jq -r 'select(.type=="tool_started")|.tool_name' "$SDIR/events.jsonl" 2>/dev/null | wc -l | tr -d ' ')
+    TURNS=$(jq -r 'select(.type=="loop_started")|1' "$SDIR/events.jsonl" 2>/dev/null | wc -l | tr -d ' ')
+    [ -n "$TURNS" ] && [ "$TURNS" != "0" ] && TURNS_SALVAGED="$TURNS"
+    cp "$SDIR/chat_history.jsonl" "$RUN_DIR/partial_chat.jsonl" 2>/dev/null
+    if [ -n "$SALV" ]; then
+      OUT="[TIMEOUT after ${ELAPSED}s — ${TURNS:-?} turns, ${TOOLS:-?} tool calls, work NOT finished.
+Resume with: grok-sub -r $SESSION -t <bigger> \"continue\"
+Last output before the kill:]
+
+$SALV"
+      printf '%s' "$OUT" > "$RUN_DIR/answer.txt"
+    fi
+  fi
+fi
+
+STATUS="ok"
+[ "$RC" -eq 124 ] && STATUS="timeout"
+[ "$RC" -ne 0 ] && [ "$RC" -ne 124 ] && STATUS="error"
+if [ "$RC" -eq 0 ] && [ -z "$OUT" ]; then
+  if [ -n "$SCHEMA" ]; then STATUS="unparseable"; RC=5; else STATUS="empty"; RC=1; fi
+fi
+# Grok reports a --max-turns cutoff as stopReason "cancelled" with a nonzero exit, NOT
+# "max_turns". Relabel it so callers can tell "ran out of turns" from a real failure.
+if [ -n "$MAX_TURNS" ] && [ "$STOP" = "cancelled" ]; then STATUS="max_turns"; fi
+[ "$STATUS" = "ok" ] && [ "$STOP" = "max_turns" ] && STATUS="max_turns"
+
+jq -n --arg label "$SAFE_LABEL" --arg status "$STATUS" --argjson exit "$RC" \
+      --arg model "$MODEL" --arg effort "$EFFORT" --arg sandbox "$SANDBOX" \
+      --arg cwd "$CWD" --arg session_id "$SESSION" --argjson elapsed_s "$ELAPSED" \
+      --arg schema "$SCHEMA" --argjson usage "$USAGE" --argjson cost_usd "$COST" \
+      --arg effort_applied "$EFFORT_APPLIED" \
+      --argjson num_turns "$TURNS" --arg stop_reason "$STOP" --arg run_dir "$RUN_DIR" \
+      '$ARGS.named' > "$RUN_DIR/meta.json"
+
+if [ "$QUIET" -ne 1 ]; then
+  echo "grok-sub[$SAFE_LABEL] $STATUS in ${ELAPSED}s | $MODEL/${EFFORT_APPLIED:-$EFFORT}/$SANDBOX | \$$COST | turns=$TURNS | session=$SESSION" >&2
+  echo "grok-sub[$SAFE_LABEL] run_dir=$RUN_DIR" >&2
+  if [ "$STATUS" = "timeout" ]; then
+    echo "grok-sub[$SAFE_LABEL] hit the -t wall at ${TIMEOUT}s after ${TURNS_SALVAGED:-?} turns — this is a BUDGET limit, not a stall." >&2
+    echo "grok-sub[$SAFE_LABEL] Unity/Blender MCP calls cost ~25-30s each, so 900s buys ~30 tool calls. Raise -t or split the brief; resume with -r $SESSION." >&2
+  elif [ "$STATUS" != "ok" ]; then tail -5 "$RUN_DIR/stderr.txt" >&2 2>/dev/null; fi
+fi
+
+printf '%s\n' "$OUT"
+exit "$RC"
+}

@@ -1,0 +1,24 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "steps", "risks", "open_questions"],
+  "properties": {
+    "summary": { "type": "string" },
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["n", "action", "files", "verification"],
+        "properties": {
+          "n": { "type": "integer" },
+          "action": { "type": "string" },
+          "files": { "type": "array", "items": { "type": "string" } },
+          "verification": { "type": "string", "description": "How to prove this step worked." }
+        }
+      }
+    },
+    "risks": { "type": "array", "items": { "type": "string" } },
+    "open_questions": { "type": "array", "items": { "type": "string" } }
+  }
+}

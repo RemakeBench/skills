@@ -1,0 +1,63 @@
+#!/bin/bash
+# codex-doctor — 10-second preflight before trusting a codex fanout.
+# Run this once per session before the first fanout. Exit 0 = safe to fan out.
+set -u
+
+# Everything below is one brace group. Bash parses a compound command IN FULL before
+# running any of it, so this process never reads the script file again after startup —
+# editing the file while a run is in flight can no longer inject garbage into that run.
+# (Observed: a long run died with "null: command not found" at a blank line because the
+# file was patched mid-flight and the interpreter resumed at a stale byte offset.)
+{
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FAIL=0
+
+say() { printf '%-22s %s\n' "$1" "$2"; }
+
+BIN=""
+for c in "${CODEX_BIN:-}" "$(command -v codex 2>/dev/null)" \
+         "/Applications/ChatGPT.app/Contents/Resources/codex" \
+         "$HOME/.codex/plugins/.plugin-appserver/codex"; do
+  if [ -n "$c" ] && [ -f "$c" ] && [ -x "$c" ]; then BIN="$c"; break; fi
+done
+if [ -z "$BIN" ]; then say "binary" "NOT FOUND — set CODEX_BIN"; exit 3; fi
+say "binary" "$BIN ($("$BIN" --version 2>/dev/null))"
+
+command -v jq >/dev/null 2>&1 && say "jq" "$(command -v jq)" || { say "jq" "MISSING — fanout needs it"; FAIL=1; }
+
+if [ -f "$HOME/.codex/auth.json" ]; then say "auth" "present"; else say "auth" "MISSING — run 'codex login'"; FAIL=1; fi
+
+say "defaults" "model=${CODEX_SUB_MODEL:-gpt-5.6-sol} effort=${CODEX_SUB_EFFORT:-medium} sandbox=${CODEX_SUB_SANDBOX:-read-only}"
+say "user config" "$(grep -E '^(model|model_reasoning_effort|approval_policy|sandbox_mode) ' "$HOME/.codex/config.toml" 2>/dev/null | tr '\n' ' ')"
+
+# Live round trip with a schema — proves auth, model access and structured output at once.
+
+# Flag contract: every short option the fanout passes to codex-sub must be one codex-sub
+# actually accepts. This is the check that would have caught the --image= regression
+# (fanout speaks the SUB-WRAPPER's interface, never the underlying binary's).
+FAN="$HERE/codex-fanout"
+ACCEPTED=$(grep -oE '^\s+-[A-Za-z]\)' "$HERE/codex-sub" | tr -dc 'A-Za-z\n' | sort -u)
+BAD=""
+for f in $(grep -oE 'ARGS\+?=?\(?\+?=\(-[A-Za-z]|ARGS\+=\(-[A-Za-z]|ARGS=\(-[A-Za-z]' "$FAN" | grep -oE '\-[A-Za-z]$' | tr -d '-' | sort -u); do
+  echo "$ACCEPTED" | grep -qx "$f" || BAD="$BAD -$f"
+done
+LONG=$(grep -oE 'ARGS\+=\("--[a-z=-]+' "$FAN" | head -1)
+[ -n "$LONG" ] && BAD="$BAD $LONG(long-opts are the binary's, not the wrapper's)"
+if [ -n "$BAD" ]; then
+  say "flag contract" "BROKEN — fanout passes options codex-sub does not accept:$BAD"; FAIL=1
+else
+  say "flag contract" "ok — every fanout flag exists in codex-sub"
+fi
+
+echo "live check ..." >&2
+OUT=$("$HERE/codex-sub" -q -l doctor -t 120 -S verdict -e low \
+      "Answer from knowledge only, run no tools: is 2+2 equal to 4?" 2>/dev/null)
+if printf '%s' "$OUT" | jq -e '.verdict=="pass"' >/dev/null 2>&1; then
+  say "live check" "ok — schema-constrained round trip succeeded"
+else
+  say "live check" "FAILED — got: $(printf '%s' "$OUT" | head -c 200)"; FAIL=1
+fi
+
+[ "$FAIL" -eq 0 ] && say "result" "READY" || say "result" "NOT READY — fix the items above"
+exit "$FAIL"
+}

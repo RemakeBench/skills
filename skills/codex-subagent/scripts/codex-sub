@@ -1,0 +1,255 @@
+#!/bin/bash
+# codex-sub — run one Codex (GPT-5.6) subagent non-interactively and return its answer.
+#
+# Defaults: model gpt-5.6-sol, reasoning effort medium, sandbox read-only.
+# Final message goes to STDOUT. Everything else (run dir, session id, usage) to STDERR.
+# Exit codes: 0 ok | 1 codex failed | 2 bad usage | 3 codex binary not found | 124 timeout
+#             5 --schema given but output did not parse as JSON
+
+set -u
+
+# Everything below is one brace group. Bash parses a compound command IN FULL before
+# running any of it, so this process never reads the script file again after startup —
+# editing the file while a run is in flight can no longer inject garbage into that run.
+# (Observed: a long run died with "null: command not found" at a blank line because the
+# file was patched mid-flight and the interpreter resumed at a stale byte offset.)
+{
+
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [ -L "$SCRIPT_PATH" ]; do
+  SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+  LINK_TARGET="$(readlink "$SCRIPT_PATH")"
+  case "$LINK_TARGET" in
+    /*) SCRIPT_PATH="$LINK_TARGET" ;;
+    *) SCRIPT_PATH="$SCRIPT_DIR/$LINK_TARGET" ;;
+  esac
+done
+SKILL_DIR="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
+
+MODEL="${CODEX_SUB_MODEL:-gpt-5.6-sol}"
+EFFORT="${CODEX_SUB_EFFORT:-medium}"
+SANDBOX="${CODEX_SUB_SANDBOX:-read-only}"
+CWD="$PWD"
+SCHEMA=""
+TIMEOUT="${CODEX_SUB_TIMEOUT:-900}"
+LABEL="run"
+RESUME=""
+QUIET=0
+EPHEMERAL=0
+PROGRESS=0
+PROMPT=""
+IMAGES=()
+ADD_DIRS=()
+
+usage() {
+  cat >&2 <<'EOF'
+codex-sub [options] "PROMPT"          (prompt may also be piped on stdin)
+
+  -m MODEL     model            (default gpt-5.6-sol)
+  -e EFFORT    minimal|low|medium|high|ultra   (default medium)
+  -s SANDBOX   read-only|workspace-write|danger-full-access  (default read-only)
+  -C DIR       working root for the subagent (default $PWD)
+  -a DIR       extra writable dir (repeatable)
+  -S SCHEMA    JSON Schema file, or a bare name from the skill's schemas/ dir
+               (verdict | findings | plan | answer). Forces structured JSON output.
+  -i IMAGE     attach an image (repeatable)
+  -t SECONDS   hard timeout (default 900)
+  -l LABEL     short label used for the run directory
+  -r SESSION   resume an existing session id (multi-turn)
+  -R DIR       explicit run directory
+  -P           stream live progress (tool calls) to stderr — use this whenever the
+               call is launched as a background Bash task, so the task panel shows
+               what the subagent is doing instead of sitting blank
+  -q           quiet: suppress the stderr banner
+  -E           ephemeral: do not persist the session (breaks -r resume later)
+  -h           this help
+
+Run artifacts land in $CODEX_SUB_RUNS (default $TMPDIR/codex-sub-runs)/<label>-<stamp>/:
+  prompt.txt  events.jsonl  last.txt  meta.json  stderr.txt
+EOF
+}
+
+need() { if [ "$2" -lt 2 ]; then echo "codex-sub: option $1 requires a value" >&2; exit 2; fi; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -m) need "$1" $#; MODEL="$2"; shift 2 ;;
+    -e) need "$1" $#; EFFORT="$2"; shift 2 ;;
+    -s) need "$1" $#; SANDBOX="$2"; shift 2 ;;
+    -C) need "$1" $#; CWD="$2"; shift 2 ;;
+    -a) need "$1" $#; ADD_DIRS+=("$2"); shift 2 ;;
+    -S) need "$1" $#; SCHEMA="$2"; shift 2 ;;
+    -i) need "$1" $#; IMAGES+=("$2"); shift 2 ;;
+    -t) need "$1" $#; TIMEOUT="$2"; shift 2 ;;
+    -l) need "$1" $#; LABEL="$2"; shift 2 ;;
+    -r) need "$1" $#; RESUME="$2"; shift 2 ;;
+    -R) need "$1" $#; RUN_DIR="$2"; shift 2 ;;
+    -P) PROGRESS=1; shift ;;
+    -q) QUIET=1; shift ;;
+    -E) EPHEMERAL=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; PROMPT="$*"; break ;;
+    -*) echo "codex-sub: unknown option $1" >&2; usage; exit 2 ;;
+    *) PROMPT="$1"; shift ;;
+  esac
+done
+
+# Prompt from stdin when not given as an argument.
+if [ -z "$PROMPT" ] && [ ! -t 0 ]; then PROMPT="$(cat)"; fi
+if [ -z "$PROMPT" ]; then echo "codex-sub: no prompt given" >&2; usage; exit 2; fi
+
+# ---- locate the codex binary -------------------------------------------------
+BIN=""
+for c in "${CODEX_BIN:-}" "$(command -v codex 2>/dev/null)" \
+         "/Applications/ChatGPT.app/Contents/Resources/codex" \
+         "${HOME:-/nonexistent}/.codex/plugins/.plugin-appserver/codex"; do
+  if [ -n "$c" ] && [ -f "$c" ] && [ -x "$c" ]; then BIN="$c"; break; fi
+done
+if [ -z "$BIN" ]; then
+  echo "codex-sub: codex binary not found (set CODEX_BIN, or install the ChatGPT desktop app)" >&2
+  exit 3
+fi
+
+# ---- resolve schema shorthand ------------------------------------------------
+# A bare name (no slash, no .json) ALWAYS means the skill's schemas/ dir. Checking the
+# filesystem first let a stray ./findings file in the workspace shadow the shorthand.
+if [ -n "$SCHEMA" ]; then
+  case "$SCHEMA" in
+    */*|*.json) : ;;
+    *) if [ -f "$SKILL_DIR/schemas/$SCHEMA.json" ]; then SCHEMA="$SKILL_DIR/schemas/$SCHEMA.json"; fi ;;
+  esac
+  if [ ! -f "$SCHEMA" ]; then echo "codex-sub: schema not found: $SCHEMA" >&2; exit 2; fi
+fi
+
+# ---- run directory -----------------------------------------------------------
+RUNS_ROOT="${CODEX_SUB_RUNS:-${TMPDIR:-/tmp}/codex-sub-runs}"
+SAFE_LABEL="$(printf '%s' "$LABEL" | tr -cs 'A-Za-z0-9._-' '-' | cut -c1-40)"
+if [ -z "${RUN_DIR:-}" ]; then
+  RUN_DIR="$RUNS_ROOT/$SAFE_LABEL-$(date +%Y%m%d-%H%M%S)-$$"
+fi
+mkdir -p "$RUN_DIR" || { echo "codex-sub: cannot create $RUN_DIR" >&2; exit 2; }
+rm -f "$RUN_DIR/.timed_out"   # -R reuse must not inherit a previous run's stamp
+printf '%s' "$PROMPT" > "$RUN_DIR/prompt.txt"
+
+# ---- assemble the command ----------------------------------------------------
+ARGS=(exec --skip-git-repo-check --json
+      -C "$CWD" -m "$MODEL" -c "model_reasoning_effort=$EFFORT" -s "$SANDBOX"
+      -o "$RUN_DIR/last.txt")
+[ "$EPHEMERAL" -eq 1 ] && ARGS+=(--ephemeral)
+[ -n "$SCHEMA" ] && ARGS+=(--output-schema "$SCHEMA")
+for d in ${ADD_DIRS+"${ADD_DIRS[@]}"}; do ARGS+=(--add-dir "$d"); done
+# codex --image is VARIADIC (-i, --image <FILE>...), so `-i FILE "PROMPT"` makes clap
+# swallow the prompt as a second image path, leaving codex with no prompt (it then
+# blocks on stdin and errors "No prompt provided via stdin"). --image=FILE is non-greedy.
+for f in ${IMAGES+"${IMAGES[@]}"}; do ARGS+=("--image=$f"); done
+# The prompt goes in on STDIN with "-" as the placeholder, never as an argv word: codex's
+# clap rejects a positional starting with "-" (a markdown list, a diff hunk), and argv also
+# caps how long a prompt can be. Both exec and `exec resume` accept "-" for stdin.
+if [ -n "$RESUME" ]; then ARGS+=(resume "$RESUME" -); else ARGS+=(-); fi
+
+START=$(date +%s)
+
+# stdin carries the prompt. It must never be a terminal or an inherited pipe: codex blocks
+# forever waiting on input if nothing is fed to it.
+"$BIN" "${ARGS[@]}" <"$RUN_DIR/prompt.txt" >"$RUN_DIR/events.jsonl" 2>"$RUN_DIR/stderr.txt" &
+PID=$!
+# The watchdog's fds MUST go to /dev/null: if its `sleep` inherits our stdout, a caller
+# using $(codex-sub ...) blocks until the full timeout even after codex has exited.
+# The `kill -0` guard is load-bearing: cleanup below kills this subshell's `sleep`, which
+# makes sleep RETURN and the subshell fall through to the next command. Without the guard it
+# stamps .timed_out on a run that finished fine — observed as a spurious exit 124.
+{ sleep "$TIMEOUT"
+  kill -0 "$PID" 2>/dev/null || exit 0
+  : > "$RUN_DIR/.timed_out"; kill -TERM "$PID" 2>/dev/null
+  sleep 5; kill -KILL "$PID" 2>/dev/null; } >/dev/null 2>&1 &
+WATCHDOG=$!
+
+# Live progress for the background-task panel. Polls the event file by line offset
+# rather than `tail -f` so it exits on its own when codex does — no orphan holding
+# the caller's stderr open.
+if [ "$PROGRESS" -eq 1 ] && [ "$QUIET" -ne 1 ]; then
+  { SEEN=0; BEAT=0
+    echo "  $SAFE_LABEL | codex $MODEL/$EFFORT starting" >&2
+    while kill -0 "$PID" 2>/dev/null; do
+      if [ -f "$RUN_DIR/events.jsonl" ]; then
+        TOTAL=$(wc -l < "$RUN_DIR/events.jsonl" 2>/dev/null | tr -d ' ')
+        TOTAL=${TOTAL:-0}
+        if [ "$TOTAL" -gt "$SEEN" ]; then
+          sed -n "$((SEEN + 1)),${TOTAL}p" "$RUN_DIR/events.jsonl" 2>/dev/null | jq -r --arg L "$SAFE_LABEL" '
+            select(.type=="item.completed") | .item |
+            if   .type=="command_execution" then "  \($L) | $ " + ((.command // "") | gsub("\n"; " ") | .[0:90])
+            elif .type=="file_change"       then "  \($L) | edit " + (.path // "")
+            elif .type=="agent_message"     then "  \($L) | message"
+            elif .type=="reasoning"         then empty
+            else "  \($L) | " + (.type // "event") end' 2>/dev/null
+          SEEN=$TOTAL
+        fi
+      fi
+      BEAT=$((BEAT + 1))
+      [ $((BEAT % 30)) -eq 0 ] && echo "  $SAFE_LABEL | still working (${BEAT}s)" >&2
+      sleep 1
+    done; } >&2 &
+  PROGRESS_PID=$!
+fi
+
+# stderr is parked while reaping so bash's "Terminated: 15" job notice on a timeout
+# does not leak into the caller's stream — the 124 exit code carries that information.
+exec 3>&2 2>/dev/null
+wait "$PID"; RC=$?
+pkill -P "$WATCHDOG" >/dev/null 2>&1
+# Wait for the emitter rather than killing it: its loop already ends when codex exits,
+# and signalling it makes bash print a "Terminated: 15 sleep" job notice to the caller.
+[ -n "${PROGRESS_PID:-}" ] && wait "$PROGRESS_PID" 2>/dev/null
+kill "$WATCHDOG" >/dev/null 2>&1
+wait "$WATCHDOG" 2>/dev/null
+exec 2>&3 3>&-
+
+END=$(date +%s); ELAPSED=$((END - START))
+# The watchdog's marker is authoritative — wall-clock comparison misfires in both directions
+# (a slow ordinary failure looked like a timeout; a TERM-trapping child looked like a success).
+if [ -f "$RUN_DIR/.timed_out" ] && [ "$RC" -ne 0 ]; then RC=124
+elif [ "$RC" -ne 0 ]; then RC=1; fi
+
+# ---- harvest metadata --------------------------------------------------------
+SESSION=""; USAGE="{}"
+if [ -s "$RUN_DIR/events.jsonl" ] && command -v jq >/dev/null 2>&1; then
+  SESSION=$(jq -r 'select(.type=="thread.started")|.thread_id' "$RUN_DIR/events.jsonl" 2>/dev/null | head -1)
+  USAGE=$(jq -c 'select(.type=="turn.completed")|.usage' "$RUN_DIR/events.jsonl" 2>/dev/null | tail -1)
+  [ -z "$USAGE" ] && USAGE="{}"
+fi
+
+OUT=""
+[ -f "$RUN_DIR/last.txt" ] && OUT="$(cat "$RUN_DIR/last.txt")"
+
+STATUS="ok"
+[ "$RC" -eq 124 ] && STATUS="timeout"
+[ "$RC" -ne 0 ] && [ "$RC" -ne 124 ] && STATUS="error"
+if [ "$RC" -eq 0 ] && [ -z "$OUT" ]; then STATUS="empty"; RC=1; fi
+
+# Schema runs must produce parseable JSON — a prose answer is a failed run, not a soft pass.
+if [ "$STATUS" = "ok" ] && [ -n "$SCHEMA" ] && command -v jq >/dev/null 2>&1; then
+  if ! printf '%s' "$OUT" | jq -e . >/dev/null 2>&1; then STATUS="unparseable"; RC=5; fi
+fi
+
+if command -v jq >/dev/null 2>&1; then
+  jq -n --arg label "$SAFE_LABEL" --arg status "$STATUS" --argjson exit "$RC" \
+        --arg model "$MODEL" --arg effort "$EFFORT" --arg sandbox "$SANDBOX" \
+        --arg cwd "$CWD" --arg session_id "$SESSION" --argjson elapsed_s "$ELAPSED" \
+        --arg schema "$SCHEMA" --argjson usage "$USAGE" --arg run_dir "$RUN_DIR" \
+        '$ARGS.named' > "$RUN_DIR/meta.json"
+else
+  printf '{"label":"%s","status":"%s","exit":%s,"elapsed_s":%s}\n' \
+    "$SAFE_LABEL" "$STATUS" "$RC" "$ELAPSED" > "$RUN_DIR/meta.json"
+fi
+
+if [ "$QUIET" -ne 1 ]; then
+  echo "codex-sub[$SAFE_LABEL] $STATUS in ${ELAPSED}s | $MODEL/$EFFORT/$SANDBOX | session=$SESSION" >&2
+  echo "codex-sub[$SAFE_LABEL] run_dir=$RUN_DIR" >&2
+  if [ "$STATUS" != "ok" ]; then
+    grep -v 'Reading additional input from stdin' "$RUN_DIR/stderr.txt" 2>/dev/null | tail -5 >&2
+  fi
+fi
+
+printf '%s\n' "$OUT"
+exit "$RC"
+}

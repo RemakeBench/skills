@@ -1,0 +1,72 @@
+#!/bin/bash
+# grok-doctor — preflight before trusting a grok fanout. Exit 0 = safe to fan out.
+set -u
+
+# Everything below is one brace group. Bash parses a compound command IN FULL before
+# running any of it, so this process never reads the script file again after startup —
+# editing the file while a run is in flight can no longer inject garbage into that run.
+# (Observed: a long run died with "null: command not found" at a blank line because the
+# file was patched mid-flight and the interpreter resumed at a stale byte offset.)
+{
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+FAIL=0
+say() { printf '%-22s %s\n' "$1" "$2"; }
+
+BIN=""
+for c in "${GROK_BIN:-}" "$(command -v grok 2>/dev/null)" \
+         "${HOME:-/nonexistent}/.local/bin/grok" "${HOME:-/nonexistent}/.grok/bin/grok"; do
+  if [ -n "$c" ] && [ -f "$c" ] && [ -x "$c" ]; then BIN="$c"; break; fi
+done
+[ -z "$BIN" ] && { say "binary" "NOT FOUND — set GROK_BIN"; exit 3; }
+say "binary" "$BIN ($("$BIN" --version 2>/dev/null))"
+
+command -v jq >/dev/null 2>&1 && say "jq" "$(command -v jq)" || { say "jq" "MISSING"; FAIL=1; }
+[ -f "$HOME/.grok/auth.json" ] && say "auth" "present" || { say "auth" "MISSING — run 'grok login'"; FAIL=1; }
+
+say "defaults" "model=${GROK_SUB_MODEL:-grok-4.6} effort=${GROK_SUB_EFFORT:-medium} sandbox=${GROK_SUB_SANDBOX:-read-only}"
+say "user config" "$(grep -E '^(default|default_reasoning_effort|permission_mode|yolo) ' "$HOME/.grok/config.toml" 2>/dev/null | tr '\n' ' ')"
+
+
+# Flag contract: every short option the fanout passes to grok-sub must be one grok-sub
+# actually accepts. This is the check that would have caught the --image= regression
+# (fanout speaks the SUB-WRAPPER's interface, never the underlying binary's).
+FAN="$HERE/grok-fanout"
+ACCEPTED=$(grep -oE '^\s+-[A-Za-z]\)' "$HERE/grok-sub" | tr -dc 'A-Za-z\n' | sort -u)
+BAD=""
+for f in $(grep -oE 'ARGS\+?=?\(?\+?=\(-[A-Za-z]|ARGS\+=\(-[A-Za-z]|ARGS=\(-[A-Za-z]' "$FAN" | grep -oE '\-[A-Za-z]$' | tr -d '-' | sort -u); do
+  echo "$ACCEPTED" | grep -qx "$f" || BAD="$BAD -$f"
+done
+LONG=$(grep -oE 'ARGS\+=\("--[a-z=-]+' "$FAN" | head -1)
+[ -n "$LONG" ] && BAD="$BAD $LONG(long-opts are the binary's, not the wrapper's)"
+if [ -n "$BAD" ]; then
+  say "flag contract" "BROKEN — fanout passes options grok-sub does not accept:$BAD"; FAIL=1
+else
+  say "flag contract" "ok — every fanout flag exists in grok-sub"
+fi
+
+echo "live check ..." >&2
+OUT=$("$HERE/grok-sub" -q -l doctor -t 120 -S verdict -e low -X \
+      "Answer from knowledge only, run no tools: is 2+2 equal to 4?" 2>/dev/null)
+if printf '%s' "$OUT" | jq -e '.verdict=="pass"' >/dev/null 2>&1; then
+  say "live check" "ok — schema-constrained round trip succeeded"
+else
+  say "live check" "FAILED — got: $(printf '%s' "$OUT" | head -c 200)"; FAIL=1
+fi
+
+# The read-only profile is kernel-enforced, but it still permits writes under /tmp,
+# /var/tmp and ~/.grok. Prove enforcement somewhere that is genuinely protected.
+SBX="$HOME/.grok-doctor-sandbox-probe"
+mkdir -p "$SBX" 2>/dev/null
+"$HERE/grok-sub" -q -l sandbox-probe -t 120 -e low -X -s read-only -C "$SBX" \
+  "Create a file named PROBE.txt in the current directory. Report the result." >/dev/null 2>&1
+if [ -e "$SBX/PROBE.txt" ]; then
+  say "sandbox" "NOT ENFORCED — read-only let a write through at $SBX"; FAIL=1
+  rm -f "$SBX/PROBE.txt"
+else
+  say "sandbox" "read-only enforced (write refused outside temp)"
+fi
+rmdir "$SBX" 2>/dev/null
+
+[ "$FAIL" -eq 0 ] && say "result" "READY" || say "result" "NOT READY — fix the items above"
+exit "$FAIL"
+}

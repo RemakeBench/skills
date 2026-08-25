@@ -109,11 +109,48 @@ def main() -> int:
             if not isinstance(case.get("should_trigger"), bool):
                 fail(f"{eval_file}[{index}]: should_trigger must be boolean", errors)
 
-    for script in SKILLS.glob("*/scripts/*.py"):
+    for script in SKILLS.glob("*/scripts/*"):
+        if not script.is_file():
+            continue
+        source = script.read_text(encoding="utf-8")
+        first_line = source.splitlines()[0] if source else ""
+        if script.suffix != ".py" and "python" not in first_line:
+            continue
         try:
-            ast.parse(script.read_text(encoding="utf-8"), filename=str(script))
+            ast.parse(source, filename=str(script))
         except SyntaxError as exc:
             fail(f"{script}: {exc}", errors)
+
+    expected_commands = {
+        "codex-sub",
+        "codex-fanout",
+        "codex-doctor",
+        "grok-sub",
+        "grok-fanout",
+        "grok-doctor",
+        "grok-mcp-server",
+    }
+    bin_dir = ROOT / "bin"
+    actual_commands = {path.name for path in bin_dir.iterdir()} if bin_dir.is_dir() else set()
+    if actual_commands != expected_commands:
+        fail(
+            f"bin command set {sorted(actual_commands)} != expected {sorted(expected_commands)}",
+            errors,
+        )
+    for command in expected_commands & actual_commands:
+        path = bin_dir / command
+        if not path.is_symlink():
+            fail(f"{path}: expected an internal symlink", errors)
+            continue
+        try:
+            target = path.resolve(strict=True)
+        except FileNotFoundError:
+            fail(f"{path}: broken symlink", errors)
+            continue
+        if ROOT not in target.parents:
+            fail(f"{path}: target escapes repository", errors)
+        if not target.stat().st_mode & 0o111:
+            fail(f"{target}: wrapper is not executable", errors)
 
     for path in ROOT.rglob("*"):
         if not path.is_file() or ".git" in path.parts:
@@ -132,7 +169,10 @@ def main() -> int:
             print(f"- {error}")
         return 1
 
-    print(f"Validated {len(skill_files)} skills, plugin manifests, evals, scripts, and public-safety markers.")
+    print(
+        f"Validated {len(skill_files)} skills, plugin manifests, evals, scripts, commands, "
+        "and public-safety markers."
+    )
     return 0
 
 

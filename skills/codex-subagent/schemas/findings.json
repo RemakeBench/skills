@@ -1,0 +1,25 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["findings", "coverage"],
+  "properties": {
+    "coverage": { "type": "string", "description": "What was actually examined, and what was not." },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["title", "file", "line", "severity", "detail", "failure_scenario", "confidence"],
+        "properties": {
+          "title": { "type": "string" },
+          "file": { "type": "string" },
+          "line": { "type": "integer" },
+          "severity": { "type": "string", "enum": ["critical", "high", "medium", "low"] },
+          "detail": { "type": "string" },
+          "failure_scenario": { "type": "string", "description": "Concrete inputs or state that produce the wrong behaviour. If you cannot write one, do not report the finding." },
+          "confidence": { "type": "string", "enum": ["high", "medium", "low"] }
+        }
+      }
+    }
+  }
+}

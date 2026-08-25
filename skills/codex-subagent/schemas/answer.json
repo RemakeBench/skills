@@ -1,0 +1,13 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["answer", "confidence", "assumptions", "unverified"],
+  "properties": {
+    "answer": { "type": "string", "description": "The direct answer. No preamble." },
+    "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
+    "assumptions": { "type": "array", "items": { "type": "string" },
+      "description": "Anything assumed rather than verified from the workspace." },
+    "unverified": { "type": "array", "items": { "type": "string" },
+      "description": "Claims in the answer that were NOT checked against files or a command." }
+  }
+}

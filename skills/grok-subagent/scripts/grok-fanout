@@ -1,0 +1,215 @@
+#!/bin/bash
+# grok-fanout — run many grok-sub jobs in parallel and return one merged index.
+#
+# Jobs come from a JSONL file, one object per line:
+#   {"label":"auth","prompt":"Review src/auth.ts for bugs","cwd":"/repo","schema":"findings"}
+# Recognised per-job keys: label prompt prompt_file cwd schema effort model sandbox timeout
+#                          max_turns tools deny_tools rules no_subagents
+# Anything omitted falls back to the flag defaults below.
+#
+# Prints a JSONL index to STDOUT — one line per job:
+#   {"label":..,"status":..,"exit":..,"elapsed_s":..,"session_id":..,"run_dir":..,"output":..,"json":..}
+# `json` is present only when the job used a schema and the output parsed.
+#
+# Exit: 0 all ok | 1 at least one job failed | 2 bad usage
+
+set -u
+
+# Everything below is one brace group. Bash parses a compound command IN FULL before
+# running any of it, so this process never reads the script file again after startup —
+# editing the file while a run is in flight can no longer inject garbage into that run.
+# (Observed: a long run died with "null: command not found" at a blank line because the
+# file was patched mid-flight and the interpreter resumed at a stale byte offset.)
+{
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SUB="$HERE/grok-sub"
+
+JOBS=""
+PAR="${GROK_FANOUT_PAR:-4}"
+DEF_EFFORT="${GROK_SUB_EFFORT:-medium}"
+DEF_MODEL="${GROK_SUB_MODEL:-grok-4.6}"
+DEF_SANDBOX="${GROK_SUB_SANDBOX:-read-only}"
+DEF_CWD="$PWD"
+DEF_SCHEMA=""
+DEF_TIMEOUT="${GROK_SUB_TIMEOUT:-900}"
+OUT_DIR=""
+PROGRESS=0
+
+usage() {
+  cat >&2 <<'EOF'
+grok-fanout -j JOBS.jsonl [options]        (jobs may also be piped on stdin)
+
+  -j FILE      jobs file (JSONL, one job object per line); "-" or omitted = stdin
+  -p N         max concurrent subagents (default 4; 6-8 is the practical ceiling)
+  -e EFFORT    default effort for jobs that don't set one   (default medium)
+  -m MODEL     default model                                 (default grok-4.6)
+  -s SANDBOX   default sandbox                               (default read-only)
+  -C DIR       default working root                          (default $PWD)
+  -S SCHEMA    default schema (file path or schemas/ name)
+  -t SECONDS   default per-job timeout                       (default 900)
+  -o DIR       collect all run dirs under DIR
+  -P           stream each job's live tool activity to stderr — pass this when the
+               fanout itself is launched as a background Bash task
+  -h           this help
+
+Concurrency note: each job is a separate Grok process with its own session — they
+cannot see each other. Split work so jobs are genuinely independent, or run a second
+fanout pass that takes the merged index as input.
+EOF
+}
+
+need() { if [ "$2" -lt 2 ]; then echo "grok-fanout: option $1 requires a value" >&2; exit 2; fi; }
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -j) need "$1" $#; JOBS="$2"; shift 2 ;;
+    -p) need "$1" $#; PAR="$2"; shift 2 ;;
+    -e) need "$1" $#; DEF_EFFORT="$2"; shift 2 ;;
+    -m) need "$1" $#; DEF_MODEL="$2"; shift 2 ;;
+    -s) need "$1" $#; DEF_SANDBOX="$2"; shift 2 ;;
+    -C) need "$1" $#; DEF_CWD="$2"; shift 2 ;;
+    -S) need "$1" $#; DEF_SCHEMA="$2"; shift 2 ;;
+    -t) need "$1" $#; DEF_TIMEOUT="$2"; shift 2 ;;
+    -o) need "$1" $#; OUT_DIR="$2"; shift 2 ;;
+    -P) PROGRESS=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "grok-fanout: unknown option $1" >&2; usage; exit 2 ;;
+  esac
+done
+
+case "$PAR" in ''|*[!0-9]*) echo "grok-fanout: -p must be a positive integer" >&2; exit 2 ;; esac
+[ "$PAR" -lt 1 ] && { echo "grok-fanout: -p must be >= 1" >&2; exit 2; }
+command -v jq >/dev/null 2>&1 || { echo "grok-fanout: jq is required" >&2; exit 2; }
+
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/grok-fanout.XXXXXX")"
+trap 'rm -rf "$TMP"' EXIT
+
+if [ -z "$JOBS" ] || [ "$JOBS" = "-" ]; then cat > "$TMP/jobs.jsonl"; else cp "$JOBS" "$TMP/jobs.jsonl"; fi
+grep -c . "$TMP/jobs.jsonl" >/dev/null 2>&1 || { echo "grok-fanout: no jobs" >&2; exit 2; }
+
+if [ -z "$OUT_DIR" ]; then
+  OUT_DIR="${GROK_SUB_RUNS:-${TMPDIR:-/tmp}/grok-sub-runs}/fanout-$(date +%Y%m%d-%H%M%S)-$$"
+fi
+mkdir -p "$OUT_DIR" || { echo "grok-fanout: cannot create $OUT_DIR" >&2; exit 2; }
+
+# Materialise each job into its own directory so the worker needs no JSON parsing.
+N=0
+while IFS= read -r line || [ -n "$line" ]; do
+  [ -z "$line" ] && continue
+  # Each line must be exactly one JSON object: jq streams multiple values from
+  # `{...} {...}` on one line, which would silently fuse two jobs into one.
+  if [ "$(printf '%s' "$line" | jq -c . 2>/dev/null | wc -l | tr -d ' ')" != "1" ]; then
+    echo "grok-fanout: line $((N + 1)) is not exactly one JSON object" >&2; exit 2
+  fi
+  N=$((N + 1))
+  JD="$TMP/job.$N"; mkdir -p "$JD"
+  printf '%s' "$line" | jq -r '.label // empty'      > "$JD/label"
+  printf '%s' "$line" | jq -r '.cwd // empty'        > "$JD/cwd"
+  printf '%s' "$line" | jq -r '.schema // empty'     > "$JD/schema"
+  printf '%s' "$line" | jq -r '.effort // empty'     > "$JD/effort"
+  printf '%s' "$line" | jq -r '.model // empty'      > "$JD/model"
+  printf '%s' "$line" | jq -r '.sandbox // empty'    > "$JD/sandbox"
+  printf '%s' "$line" | jq -r '.timeout // empty'    > "$JD/timeout"
+  printf '%s' "$line" | jq -r '.max_turns // empty'   > "$JD/max_turns"
+  printf '%s' "$line" | jq -r '(.tools // empty) | if type=="array" then join(",") else . end'           > "$JD/tools"
+  printf '%s' "$line" | jq -r '(.deny_tools // empty) | if type=="array" then join(",") else . end'      > "$JD/deny_tools"
+  printf '%s' "$line" | jq -r '.rules // empty'      > "$JD/rules"
+  printf '%s' "$line" | jq -r 'if .no_subagents then "1" else "" end' > "$JD/no_subagents"
+  PF="$(printf '%s' "$line" | jq -r '.prompt_file // empty')"
+  if [ -n "$PF" ]; then
+    [ -f "$PF" ] || { echo "grok-fanout: job $N prompt_file not found: $PF" >&2; exit 2; }
+    cp "$PF" "$JD/prompt"
+  else printf '%s' "$line" | jq -r '.prompt // empty' > "$JD/prompt"; fi
+  [ -s "$JD/label" ] || printf 'job%d' "$N" > "$JD/label"
+  cp "$JD/label" "$JD/label_raw"
+  # Labels become directory names — strip anything that could escape OUT_DIR.
+  SAFE=$(tr -d '\n' < "$JD/label" | tr -cs 'A-Za-z0-9._-' '-' | sed 's/^[.-]*//; s/[-.]*$//' | cut -c1-40)
+  [ -z "$SAFE" ] && SAFE="job$N"
+  printf '%s' "$SAFE" > "$JD/label"   # dir-safe name; label_raw keeps the caller's
+  if [ -z "$(tr -d '[:space:]' < "$JD/prompt")" ]; then
+    echo "grok-fanout: job $N has an empty prompt" >&2; exit 2
+  fi
+done < "$TMP/jobs.jsonl"
+
+[ "$N" -eq 0 ] && { echo "grok-fanout: no jobs" >&2; exit 2; }
+echo "grok-fanout: $N jobs, up to $PAR at a time -> $OUT_DIR" >&2
+
+# --- worker -------------------------------------------------------------------
+cat > "$TMP/worker.sh" <<'WORKER'
+#!/bin/bash
+set -u
+JD="$1"
+IDX="$(basename "$JD" | sed 's/^job\.//')"
+LABEL=$(cat "$JD/label")
+CWD=$(cat "$JD/cwd");         [ -z "$CWD" ] && CWD="$DEF_CWD"
+SCHEMA=$(cat "$JD/schema");   [ -z "$SCHEMA" ] && SCHEMA="$DEF_SCHEMA"
+EFFORT=$(cat "$JD/effort");   [ -z "$EFFORT" ] && EFFORT="$DEF_EFFORT"
+MODEL=$(cat "$JD/model");     [ -z "$MODEL" ] && MODEL="$DEF_MODEL"
+SANDBOX=$(cat "$JD/sandbox"); [ -z "$SANDBOX" ] && SANDBOX="$DEF_SANDBOX"
+TIMEOUT=$(cat "$JD/timeout"); [ -z "$TIMEOUT" ] && TIMEOUT="$DEF_TIMEOUT"
+
+ARGS=(-l "$LABEL" -C "$CWD" -e "$EFFORT" -m "$MODEL" -s "$SANDBOX" -t "$TIMEOUT")
+[ -n "$SCHEMA" ] && ARGS+=(-S "$SCHEMA")
+MT=$(cat "$JD/max_turns");    [ -n "$MT" ] && ARGS+=(-n "$MT")
+TL=$(cat "$JD/tools");        [ -n "$TL" ] && ARGS+=(-T "$TL")
+DT=$(cat "$JD/deny_tools");   [ -n "$DT" ] && ARGS+=(-D "$DT")
+RU=$(cat "$JD/rules");        [ -n "$RU" ] && ARGS+=(-u "$RU")
+NS=$(cat "$JD/no_subagents"); [ -n "$NS" ] && ARGS+=(-X)
+ARGS+=(-R "$OUT_DIR/$IDX-$LABEL")
+
+# `--` is mandatory: a prompt starting with "-" (a markdown list, a diff hunk)
+# would otherwise be parsed as an option, and "-h" would silently print help.
+# With -P the sub-wrapper's stderr must stay INHERITED, not redirected to a file —
+# a file cannot stream, and the whole point is live lines in the task panel. Each
+# line is label-prefixed, so interleaving across parallel jobs stays readable.
+if [ "${PROGRESS:-0}" -eq 1 ]; then
+  ARGS+=(-P)
+  "$SUB" "${ARGS[@]}" -- "$(cat "$JD/prompt")" > "$JD/out.txt"
+else
+  ARGS+=(-q)
+  "$SUB" "${ARGS[@]}" -- "$(cat "$JD/prompt")" > "$JD/out.txt" 2> "$JD/err.txt"
+fi
+echo $? > "$JD/rc"
+echo "  [$LABEL] rc=$(cat "$JD/rc")" >&2
+WORKER
+chmod +x "$TMP/worker.sh"
+
+export PROGRESS SUB DEF_CWD DEF_SCHEMA DEF_EFFORT DEF_MODEL DEF_SANDBOX DEF_TIMEOUT OUT_DIR
+
+# NUL-delimited: a space anywhere in TMPDIR would otherwise split job paths into
+# two bogus arguments and every worker would fail to find its job directory.
+I=0
+while [ "$I" -lt "$N" ]; do I=$((I + 1)); printf '%s\0' "$TMP/job.$I"; done \
+  | xargs -0 -P "$PAR" -n 1 "$TMP/worker.sh"
+
+# --- merge --------------------------------------------------------------------
+FAILED=0
+I=0
+while [ "$I" -lt "$N" ]; do
+  I=$((I + 1)); JD="$TMP/job.$I"
+  LABEL=$(cat "$JD/label"); RAW=$(cat "$JD/label_raw" 2>/dev/null || echo "$LABEL")
+  RC=$(cat "$JD/rc" 2>/dev/null || echo 1)
+  [ "$RC" -ne 0 ] && FAILED=1
+  META="{}"
+  RD="$OUT_DIR/$I-$LABEL"
+  [ -f "$RD/meta.json" ] && META=$(jq -c . "$RD/meta.json" 2>/dev/null || echo '{}')
+  [ -f "$JD/out.txt" ] || : > "$JD/out.txt"   # a worker that died pre-redirect leaves none
+  # On failure the index MUST carry the sub-wrapper's stderr: a fanout flag typo once
+  # surfaced as exit 2 with an empty error field and was misread as a model failure.
+  ERRTXT=""
+  [ "$RC" -ne 0 ] && [ -f "$JD/err.txt" ] && ERRTXT=$(grep -v 'Reading additional input from stdin' "$JD/err.txt" | tail -3 | tr '\n' ' ')
+  jq -n --arg label "$RAW" --argjson rc "$RC" --arg errtxt "$ERRTXT" \
+        --rawfile out "$JD/out.txt" --argjson meta "$META" '
+    {label:$label, exit:$rc,
+     error: (if $errtxt != "" then $errtxt else null end),
+     status: ($meta.status // (if $rc==0 then "ok" else "error" end)),
+     elapsed_s: $meta.elapsed_s, session_id: $meta.session_id,
+     run_dir: $meta.run_dir, usage: $meta.usage,
+     cost_usd: $meta.cost_usd, num_turns: $meta.num_turns, stop_reason: $meta.stop_reason,
+     output: ($out|rtrimstr("\n"))}
+    | (if ($meta.schema // "") != "" then . + (try {json: ($out|fromjson)} catch {}) else . end)'
+done
+
+exit "$FAILED"
+}
