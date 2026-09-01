@@ -1,0 +1,10 @@
+[
+  {"query": "Turn this samurai character sheet into separate armor pieces I can send through Tripo, with front left right and back images for each part.", "should_trigger": true},
+  {"query": "Make a modular Japanese village kit for Meshy: repeatable wall, gate, corner, roof and bridge pieces, each isolated for reconstruction.", "should_trigger": true},
+  {"query": "Split the coat, mask, boots and shoulder armor from this concept art into image-to-3D reference plates without changing the design.", "should_trigger": true},
+  {"query": "The side references for this long gate keep showing the broad face. Regenerate true narrow end views for the reconstruction pack.", "should_trigger": true},
+  {"query": "Generate a cinematic thumbnail of a samurai standing at a temple gate in the rain.", "should_trigger": false},
+  {"query": "Create one beauty concept image for a fantasy village at sunset.", "should_trigger": false},
+  {"query": "Retopologize this existing Tripo mesh and export a game-ready glTF.", "should_trigger": false},
+  {"query": "Make six seamless PBR materials for stone walls and roof tiles.", "should_trigger": false}
+]

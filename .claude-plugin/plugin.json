@@ -1,7 +1,7 @@
 {
   "name": "remakebench-skills",
-  "version": "0.2.0",
-  "description": "Evidence-driven Claude Code skills for playable 3D production, quality gates, gameplay verification, and cross-model Codex and Grok subagents.",
+  "version": "0.3.0",
+  "description": "Evidence-driven Claude Code skills for playable 3D production, image-to-3D reconstruction, quality gates, gameplay verification, and cross-model subagents.",
   "author": {
     "name": "RemakeBench",
     "url": "https://github.com/RemakeBench"
@@ -15,6 +15,9 @@
     "game-development",
     "3d",
     "blender",
+    "image-to-3d",
+    "tripo",
+    "meshy",
     "quality-assurance",
     "codex",
     "grok",
@@ -23,6 +26,7 @@
   "skills": [
     "./skills/reference-pack-authority",
     "./skills/game-production-stages",
+    "./skills/image-to-3d-modular-kit",
     "./skills/3d-asset-quality",
     "./skills/asset-judge-loop",
     "./skills/verify-by-playing",

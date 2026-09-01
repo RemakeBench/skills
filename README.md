@@ -1,11 +1,12 @@
 # RemakeBench Skills
 
-Production gates and cross-model subagents for Claude Code.
+Production gates, image-to-3D reconstruction workflows, and cross-model subagents for Claude
+Code.
 
 These Claude Code skills turn recurring failure modes into reusable workflows: contradictory
-reference packs, primitive-looking assets, effort dilution across batches, green tests on broken
-gameplay, production stages completed in the wrong order, and reviews that need an independent
-second model.
+reference packs, reconstruction views that collapse into ambiguous geometry, primitive-looking
+assets, effort dilution across batches, green tests on broken gameplay, production stages
+completed in the wrong order, and reviews that need an independent second model.
 
 They are opinionated because the failures were real. Each rule exists to make evidence harder to
 fake and quality easier to reproduce.
@@ -36,6 +37,7 @@ skill explicitly through the `remakebench-skills` plugin namespace.
 |---|---|
 | [`reference-pack-authority`](skills/reference-pack-authority/) | Generated concept-art packs get a written spatial source of truth and a congruence pass before geometry begins. |
 | [`game-production-stages`](skills/game-production-stages/) | A playable placeholder sandbox exists before production assets, and every stage has an evidence-backed exit gate. |
+| [`image-to-3d-modular-kit`](skills/image-to-3d-modular-kit/) | Image-to-3D reconstruction packs split practical modules into isolated, consistent front/left/right/back plates with readable thickness and joins. |
 | [`3d-asset-quality`](skills/3d-asset-quality/) | Assets model functional construction, thickness, and bevels, then prove it in geometry-only acceptance renders. |
 | [`asset-judge-loop`](skills/asset-judge-loop/) | Multi-asset batches use independent judges, minimum scoring, inventory reconciliation, and rebuild loops. |
 | [`verify-by-playing`](skills/verify-by-playing/) | Playable software is accepted through real input, route traversal, camera ownership, exercised verbs, and inspected frames. |
@@ -48,15 +50,17 @@ skill explicitly through the `remakebench-skills` plugin namespace.
 reference pack
   -> congruence gate
   -> playable greybox
+  -> modular reconstruction plates when image-to-3D is used
   -> asset build + independent judge loop
   -> assembly
   -> play with real input
   -> ship evidence
 ```
 
-The production skills are composable. `game-production-stages` routes the other four; each
-specialist skill also works independently when its trigger applies. The two subagent skills are
-optional cross-model tools and do not change the production gates.
+The production skills are composable. `game-production-stages` routes the four core production
+gates; `image-to-3d-modular-kit` slots into asset planning whenever reconstruction services are
+used. Each specialist skill also works independently when its trigger applies. The two subagent
+skills are optional cross-model tools and do not change the production gates.
 
 ## Optional subagent prerequisites
 
